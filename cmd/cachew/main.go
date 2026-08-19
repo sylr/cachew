@@ -14,7 +14,9 @@ import (
 	"github.com/alecthomas/kong"
 
 	"github.com/block/cachew/client"
+	"github.com/block/cachew/internal/clientconfig"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/tokensource"
 	"github.com/block/cachew/internal/tracing"
 )
 
@@ -31,8 +33,13 @@ type CLI struct {
 
 	LoggingConfig logging.Config `embed:"" prefix:"log-"`
 
-	URL           string `help:"Remote cache server URL." default:"http://127.0.0.1:8080"`
-	Authorization string `help:"Authorization header value (e.g. 'Bearer <token>')."`
+	// URL deliberately has no kong default: the resolved value depends on whether
+	// the user actually passed the flag, which a default would make
+	// indistinguishable. See clientconfig.ResolveURL for the precedence.
+	URL           string `help:"Remote cache server URL (default http://127.0.0.1:8080, or the selected context's url)."`
+	Config        string `help:"Client configuration file (default ~/.config/cachew/config.hcl)."`
+	Context       string `help:"Configuration context to use."`
+	Authorization string `help:"Authorization header value (e.g. 'Bearer <token>'). Overrides the context's OIDC token source."`
 	Platform      bool   `help:"Prefix keys with platform ($${os}-$${arch}-)."`
 	Daily         bool   `help:"Prefix keys with date ($${YYYY}-$${MM}-$${DD}-). Mutually exclusive with --hourly." xor:"timeprefix"`
 	Hourly        bool   `help:"Prefix keys with date and hour ($${YYYY}-$${MM}-$${DD}-$${HH}-). Mutually exclusive with --daily." xor:"timeprefix"`
@@ -68,13 +75,13 @@ func run() int {
 		defer stopTracing()
 	}
 
-	var headerFunc client.HeaderFunc
-	if cli.Authorization != "" {
-		headerFunc = func() http.Header {
-			return http.Header{"Authorization": {cli.Authorization}}
-		}
+	url, headerFunc, err := resolveConnection(ctx, &cli)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cachew: %s\n", err) //nolint:forbidigo
+		return 1
 	}
-	c := client.New(cli.URL, headerFunc)
+
+	c := client.New(url, headerFunc)
 	defer c.Close()
 
 	kctx.BindTo(ctx, (*context.Context)(nil))
@@ -86,6 +93,86 @@ func run() int {
 	}
 	kctx.FatalIfErrorf(err)
 	return 0
+}
+
+// resolveConnection determines the server URL and how to authenticate to it,
+// combining flags, environment variables and the selected configuration context.
+//
+// The token is minted eagerly so a misconfigured source fails immediately with the
+// underlying STS or command error, rather than surfacing mid-transfer as a bare
+// 403 from the server.
+func resolveConnection(ctx context.Context, cli *CLI) (string, client.HeaderFunc, error) {
+	envURL := os.Getenv("CACHEW_URL")
+
+	// An explicit --authorization wins, so existing scripts keep working even
+	// against a context that also configures OIDC. When the URL is also fully
+	// flag-determined the config file is never consulted, so a missing home
+	// directory or an unreadable config cannot break invocations that never
+	// needed it.
+	if cli.Authorization != "" {
+		header := http.Header{"Authorization": {cli.Authorization}}
+		headerFunc := func(context.Context) (http.Header, error) { return header, nil }
+		if cli.URL != "" || envURL != "" {
+			return clientconfig.ResolveURL(cli.URL, envURL, nil), headerFunc, nil
+		}
+		cachewContext, err := loadContext(cli)
+		if err != nil {
+			return "", nil, err
+		}
+		return clientconfig.ResolveURL(cli.URL, envURL, cachewContext), headerFunc, nil
+	}
+
+	cachewContext, err := loadContext(cli)
+	if err != nil {
+		return "", nil, err
+	}
+	url := clientconfig.ResolveURL(cli.URL, envURL, cachewContext)
+
+	if cachewContext == nil || cachewContext.OIDC == nil {
+		return url, nil, nil
+	}
+
+	source, err := tokensource.New(ctx, cachewContext.Name, *cachewContext.OIDC)
+	if err != nil {
+		return "", nil, errors.WithStack(err)
+	}
+	if _, err := source.Token(ctx); err != nil {
+		return "", nil, errors.WithStack(err)
+	}
+
+	headerFunc := func(ctx context.Context) (http.Header, error) {
+		token, err := source.Token(ctx)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return http.Header{"Authorization": {"Bearer " + token}}, nil
+	}
+	return url, headerFunc, nil
+}
+
+// loadContext loads the client configuration and resolves the selected context.
+func loadContext(cli *CLI) (*clientconfig.Context, error) {
+	path, explicit, err := clientconfig.Path(cli.Config)
+	if err != nil {
+		// Only reachable when nothing points at a config file (no flag, no env,
+		// no home directory), which simply means there is no configuration —
+		// unless a context was requested, which then cannot be honoured.
+		if cli.Context != "" || os.Getenv("CACHEW_CONTEXT") != "" {
+			return nil, errors.WithStack(err)
+		}
+		// No context is a normal outcome: cachew falls back to flags and
+		// environment variables exactly as it did before contexts existed.
+		return nil, nil //nolint:nilnil
+	}
+	cfg, err := clientconfig.Load(path, explicit)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	cachewContext, err := cfg.Resolve(cli.Context)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return cachewContext, nil
 }
 
 // errCacheMiss signals that a restore found no object for the requested key.

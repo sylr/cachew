@@ -280,14 +280,47 @@ func TestHeaderFuncAppliesAuth(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := client.New(srv.URL, func() http.Header {
-		return http.Header{"Authorization": {"Bearer token"}}
+	c := client.New(srv.URL, func(context.Context) (http.Header, error) {
+		return http.Header{"Authorization": {"Bearer token"}}, nil
 	})
 	defer c.Close()
 
 	_, err := c.Stat(t.Context(), client.NewKey("missing"))
 	assert.Error(t, err)
 	assert.Equal(t, "Bearer token", seenAuth)
+}
+
+func TestHeaderFuncErrorSurfaces(t *testing.T) {
+	srv := newFakeServer(nil)
+	defer srv.Close()
+
+	c := client.New(srv.URL, func(context.Context) (http.Header, error) {
+		return nil, errors.New("mint failed")
+	})
+	defer c.Close()
+
+	_, err := c.Stat(t.Context(), client.NewKey("missing"))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mint failed")
+}
+
+func TestHeaderFuncErrorSurfacesFromCreateClose(t *testing.T) {
+	srv := newFakeServer(nil)
+	defer srv.Close()
+
+	c := client.New(srv.URL, func(context.Context) (http.Header, error) {
+		return nil, errors.New("mint failed")
+	})
+	defer c.Close()
+
+	w, err := c.Create(t.Context(), client.NewKey("key"), nil, 0)
+	assert.NoError(t, err)
+
+	// Close, not Write: the request has already failed, and writing to the upload
+	// pipe blocks until the request body is closed.
+	err = w.Close()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mint failed")
 }
 
 func TestListNamespaces(t *testing.T) {

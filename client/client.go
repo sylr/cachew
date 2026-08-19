@@ -66,7 +66,16 @@ type CacheWriter interface {
 }
 
 // HeaderFunc returns headers to attach to each outgoing request.
-type HeaderFunc func() http.Header
+//
+// It takes a context and may fail, because obtaining a credential can require
+// network access — minting an OIDC token, for example. Returning an error fails
+// the request that needed the header, so the caller sees why authentication was
+// not attempted instead of an opaque 403 from the server.
+//
+// Note that Create performs its request on a goroutine, so an error from
+// HeaderFunc during an upload surfaces from CacheWriter.Close rather than from
+// Create itself.
+type HeaderFunc func(ctx context.Context) (http.Header, error)
 
 // NewHTTPClient creates an *http.Client that attaches headerFunc headers
 // to every outgoing request. Useful for callers that need to talk to
@@ -94,7 +103,11 @@ type headerTransport struct {
 }
 
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	for key, values := range t.headerFunc() {
+	headers, err := t.headerFunc(req.Context())
+	if err != nil {
+		return nil, errors.Errorf("resolve request headers: %w", err)
+	}
+	for key, values := range headers {
 		for _, value := range values {
 			req.Header.Add(key, value)
 		}
