@@ -156,10 +156,14 @@ opa {
   policy = <<EOF
     package cachew.authz
     default allow := false
-    allow if input.headers["authorization"]
+    allow if startswith(input.remote_addr, "127.0.0.1:")
   EOF
 }
 ```
+
+Do not authenticate on the raw `Authorization` header (`allow if input.headers["authorization"]`):
+any value satisfies it, including one an attacker chooses. Use a verified token instead — see
+[OIDC Authentication](#oidc-authentication).
 
 Or reference an external file with optional data:
 
@@ -170,7 +174,10 @@ opa {
 }
 ```
 
-**Input fields:** `input.method`, `input.path` (string array), `input.headers`, `input.remote_addr` (includes port — use `startswith` to match by IP).
+**Input fields:** `input.method`, `input.path` (string array), `input.headers`, `input.remote_addr` (includes port — use `startswith` to match by IP), and `input.token` when a verified OIDC bearer token was presented (see [OIDC Authentication](#oidc-authentication)).
+
+When at least one `oidc-issuer` is configured, `authorization` is omitted from `input.headers`, so
+a policy cannot accidentally authenticate on an unverified header.
 
 ### Testing policies
 
@@ -192,6 +199,192 @@ opa {
   EOF
 }
 ```
+
+## OIDC Authentication
+
+`cachewd` can verify `Authorization: Bearer <jwt>` tokens against one or more trusted OIDC
+issuers, and hand the verified claims to the OPA policy as `input.token`. This is how remote
+callers reach `/api/*` and `/admin/*` without widening an IP allow-list or sharing a static
+secret.
+
+```hcl
+oidc-issuer "https://abc123-def456-ghi789.tokens.sts.global.api.aws" {
+  audiences   = ["https://cachew.example.com"]
+  # jwks-uri   = "..."               # skip OIDC discovery
+  # algorithms = ["RS256", "ES384"]  # only asymmetric algorithms are accepted
+  # clock-skew = "30s"
+}
+```
+
+The issuer label must exactly match the token's `iss` claim. `audiences` is required: it is what
+stops a token minted for a different service being replayed at cachew.
+
+Behaviour:
+
+- **No token, a non-`Bearer` scheme, or a Bearer credential for something else** — the request
+  passes through unchanged and carries no claims, so existing localhost and path rules apply as
+  before. "Something else" means an opaque token or a JWT whose `iss` is not a configured issuer:
+  strategies that forward client credentials upstream (artifactory, github-releases) keep
+  working. A passed-through credential yields no `input.token`, so policy still denies `/api`
+  and `/admin`.
+- **A `Bearer` JWT naming a configured issuer that fails verification** — rejected with `401`
+  before policy runs. That covers a bad signature, an expired or not-yet-valid token, a missing
+  expiry, a disallowed algorithm, a missing `kid`, and a mismatched audience.
+- **A verified token** — `input.token` is populated and policy decides.
+
+`cachewd` starts even if an issuer is temporarily unreachable; until its keys can be fetched,
+every bearer token is rejected with `401`. Invalid *configuration*, by contrast, is fatal at
+startup.
+
+Issuers must be configured in the config file. Unlike other settings, they cannot be supplied via
+`CACHEW_*` environment variables, because the issuer URL is a block label.
+
+### Writing policy against claims
+
+```
+input.token = {
+  "issuer":   "https://abc123-def456.tokens.sts.global.api.aws",
+  "subject":  "arn:aws:iam::123456789012:role/cachew-admin",
+  "audience": ["https://cachew.example.com"],
+  "claims":   { ... every claim in the token ... }
+}
+```
+
+For AWS STS, `sub` is the **ARN of the IAM principal** that requested the token, and all
+AWS-specific claims are nested under a single claim named `https://sts.amazonaws.com/` —
+`aws_account`, `source_region`, `org_id`, `principal_tags`, `request_tags`, plus session context
+such as `ec2_source_instance_arn`. That key contains slashes, so Rego must use bracket notation.
+
+```hcl
+opa {
+  policy = <<EOF
+    package cachew.authz
+
+    default allow := false
+
+    # Unauthenticated: loopback is trusted, and the strategy paths stay public.
+    allow if startswith(input.remote_addr, "127.0.0.1:")
+    allow if not input.path[0] in {"api", "admin"}
+
+    aws := input.token.claims["https://sts.amazonaws.com/"]
+
+    # Profiling endpoints are never reachable over the network, token or not.
+    # Note this is a predicate the allow rules exclude, not a competing
+    # `allow := false` rule, which would be an eval_conflict_error.
+    is_pprof if {
+      input.path[0] == "admin"
+      input.path[1] == "pprof"
+    }
+
+    allow if {
+      input.path[0] == "api"
+      input.token.subject in {
+        "arn:aws:iam::123456789012:role/cachew-ci",
+        "arn:aws:iam::123456789012:role/cachew-admin",
+      }
+    }
+
+    allow if {
+      input.path[0] == "admin"
+      not is_pprof
+      aws.aws_account == "123456789012"
+      aws.principal_tags.team == "platform"
+    }
+  EOF
+}
+```
+
+`input.token` is absent for unauthenticated requests, so every rule above becomes *undefined*
+rather than false and `default allow := false` wins. The policy is fail-closed by construction.
+
+### Finding your AWS issuer URL
+
+The issuer is account-specific, so read it from a real token rather than guessing:
+
+```sh
+aws sts get-web-identity-token \
+  --audience https://cachew.example.com \
+  --signing-algorithm RS256 \
+  --region eu-west-1 \
+  --query WebIdentityToken --output text
+```
+
+Decode the payload to see `iss`, `sub` and the nested claims. Note that this API is not available
+on the global STS endpoint, and the account must have outbound web identity federation enabled —
+otherwise it returns `OutboundWebIdentityFederationDisabled`.
+
+## Client Configuration
+
+The `cachew` client reads an optional HCL configuration file holding named **contexts**, each
+describing a server and how to authenticate to it. Resolution order:
+`--config`, `$CACHEW_CONFIG`, `$XDG_CONFIG_HOME/cachew/config.hcl`,
+`~/.config/cachew/config.hcl`. A missing file is fine — cachew works with no configuration.
+
+```hcl
+default-context = "prod"
+
+context "prod" {
+  url         = "https://cachew.example.com"
+  description = "prod via OIDC"
+  oidc {
+    audience             = ["https://cachew.example.com"]
+    signing-algorithm    = "RS256"     # RS256 or ES384
+    duration             = "15m"       # 60s to 1h
+    cache                = true
+    cache-refresh-before = "2m"
+    aws-sts {
+      region  = "eu-west-1"
+      profile = "my-profile"
+      # tags = { "team": "platform" }  # become request_tags claims
+      # assume-role {
+      #   role-arn     = "arn:aws:iam::111111111111:role/cachew-oidc"
+      #   session-name = "cachew-cli"
+      # }
+    }
+  }
+}
+
+context "local" {
+  url = "http://127.0.0.1:8080"
+}
+```
+
+Select a context with `--context` (`CACHEW_CONTEXT`). With no context named, `default-context` is
+used; failing that, a lone context is taken as implicit.
+
+**Token sources** — exactly one per `oidc` block:
+
+- `aws-sts` — calls `sts:GetWebIdentityToken`, so an existing AWS identity becomes the cachew
+  identity with no new credential to distribute. `region` is required.
+- `exec` — runs a command and reads the token from stdout, for any other issuer:
+  ```hcl
+  exec {
+    command = ["aws", "sts", "get-web-identity-token",
+               "--audience", "https://cachew.example.com",
+               "--signing-algorithm", "RS256",
+               "--query", "WebIdentityToken", "--output", "text"]
+  }
+  ```
+- `static` — one of `token`, `token-file` or `token-env`, for a token the platform already
+  provides (a Kubernetes projected service-account token, a GitHub Actions ID token). It is never
+  cached: `token-file` and `token-env` are re-read on every request so in-place rotation is
+  picked up immediately.
+
+With `cache = true`, `aws-sts` and `exec` tokens are stored at
+`<user cache dir>/cachew/tokens/<context>-<config hash>.jwt` with `0600` permissions and reused
+until `cache-refresh-before` ahead of expiry, so a script calling `cachew` in a loop does not
+mint one per invocation. The filename embeds a hash of the context's `oidc` settings and, for `aws-sts`, the ambient
+identity selectors (`AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_ROLE_ARN`,
+`AWS_WEB_IDENTITY_TOKEN_FILE`), so editing the context or switching profile invalidates the
+entry instead of replaying a token minted for the previous identity. Raw exported credentials
+(`AWS_ACCESS_KEY_ID` etc.) are not tracked — they rotate for the same identity — so when
+switching identities that way, use distinct profiles or `cache = false`.
+A cache entry is ignored unless it is a regular file with owner-only permissions, and
+`cache-refresh-before` must be shorter than `duration`. These are bearer credentials: anyone
+holding one can use it until it expires, so keep `duration` short and prefer `cache = false` on
+shared machines.
+
+`--authorization` still works and takes precedence over a context's OIDC source.
 
 ## GitHub App Authentication
 
@@ -234,7 +427,10 @@ cachew restore <namespace> <directory> (--key <key> | -H <glob>)  # exit 0 hit, 
 cachew git restore <repo-url> <directory> [--no-bundle]
 ```
 
-**Global flags:** `--url` (`CACHEW_URL`), `--authorization` (`CACHEW_AUTHORIZATION`), `--platform` (prefix keys with `os-arch`), `--daily`/`--hourly` (prefix keys with date).
+**Global flags:** `--url` (`CACHEW_URL`), `--config` (`CACHEW_CONFIG`), `--context` (`CACHEW_CONTEXT`), `--authorization` (`CACHEW_AUTHORIZATION`), `--platform` (prefix keys with `os-arch`), `--daily`/`--hourly` (prefix keys with date).
+
+`--url` wins over `CACHEW_URL`, which wins over the selected context's `url`, which wins over the
+`http://127.0.0.1:8080` default. See [Client Configuration](#client-configuration).
 
 ## Observability
 
