@@ -32,6 +32,7 @@ import (
 	"github.com/block/cachew/internal/metadatadb"
 	metadatas3 "github.com/block/cachew/internal/metadatadb/s3"
 	"github.com/block/cachew/internal/metrics"
+	"github.com/block/cachew/internal/oidc"
 	"github.com/block/cachew/internal/opa"
 	"github.com/block/cachew/internal/reaper"
 	"github.com/block/cachew/internal/s3client"
@@ -56,6 +57,10 @@ type GlobalConfig struct {
 	S3Config         s3client.Config     `hcl:"s3,block,optional"`
 	GithubAppConfigs []githubapp.Config  `hcl:"github-app,block,optional"`
 	OPAConfig        opa.Config          `hcl:"opa,block"`
+	// OIDCConfigs cannot be supplied via environment variables: config.InjectEnvars
+	// matches blocks by name and cannot synthesise the issuer label. Configure
+	// issuers in the config file, using ${VAR} expansion if they need templating.
+	OIDCConfigs []oidc.Config `hcl:"oidc-issuer,block,optional"`
 }
 
 // Populated via -ldflags at build time.
@@ -164,6 +169,7 @@ func main() {
 		globalConfig.MetricsConfig,
 		globalConfig.OPAConfig,
 		globalConfig.LoggingConfig,
+		globalConfig.OIDCConfigs,
 	)
 	fatalIfError(ctx, logger, err, "Failed to create server")
 
@@ -380,17 +386,36 @@ func newServer(
 	metricsConfig metrics.Config,
 	opaConfig opa.Config,
 	logConfig logging.Config,
+	oidcConfigs []oidc.Config,
 ) (*http.Server, error) {
+	logger := logging.FromContext(ctx)
+
+	// Configuration errors are fatal: an issuer that can never match would leave
+	// the admin API relying on a policy that cannot authenticate anyone. Failures
+	// reaching the issuer are not, because JWKS resolution is retried per request
+	// and until it succeeds every bearer token is rejected with 401.
+	verifier, err := oidc.NewVerifier(ctx, oidcConfigs, http.DefaultClient)
+	if err != nil {
+		return nil, errors.Errorf("initialise OIDC verification: %w", err)
+	}
+	if verifier != nil {
+		logger.InfoContext(ctx, "OIDC bearer token verification enabled", "issuers", verifier.Issuers())
+	}
+
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		labeler, _ := otelhttp.LabelerFromContext(r.Context())
 		labeler.Add(attribute.String("cachew.http.path.prefix", extractPathPrefix(r.URL.Path)))
 		muxHandler.ServeHTTP(w, r)
 	})
 
-	handler, err := opa.Middleware(ctx, opaConfig, handler)
+	handler, err = opa.Middleware(ctx, opaConfig, verifier != nil, handler)
 	if err != nil {
 		return nil, errors.Errorf("initialise OPA middleware: %w", err)
 	}
+
+	// Outside OPA, so that verified claims are available as input.token when the
+	// policy is evaluated, and so an invalid token is rejected before policy runs.
+	handler = oidc.Middleware(verifier, handler)
 
 	// Add standard otelhttp middleware
 	handler = otelhttp.NewMiddleware(metricsConfig.ServiceName,
@@ -400,7 +425,6 @@ func newServer(
 
 	handler = logging.Middleware(handler, logConfig)
 
-	logger := logging.FromContext(ctx)
 	// Strip cancellation so SIGTERM doesn't abort in-flight handlers via
 	// r.Context(); Server.Shutdown is what waits for them to finish.
 	baseCtx := context.WithoutCancel(ctx)

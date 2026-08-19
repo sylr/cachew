@@ -39,7 +39,7 @@ func TestMiddlewareDefaultPolicy(t *testing.T) {
 	}
 
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{}, false, next)
 	assert.NoError(t, err)
 
 	for _, test := range tests {
@@ -59,7 +59,7 @@ default allow := false
 allow if input.method == "POST"
 `
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, false, next)
 	assert.NoError(t, err)
 
 	tests := []struct {
@@ -90,7 +90,7 @@ allow if input.path[0] == "public"
 	assert.NoError(t, os.WriteFile(path, []byte(policy), 0o644))
 
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{PolicyFile: path}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{PolicyFile: path}, false, next)
 	assert.NoError(t, err)
 
 	tests := []struct {
@@ -118,7 +118,7 @@ allow if input.path[0] == "api"
 allow if input.path[0] == "_liveness"
 `
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, false, next)
 	assert.NoError(t, err)
 
 	tests := []struct {
@@ -149,7 +149,7 @@ allow if data.allowed_methods[input.method]
 	handler, err := opa.Middleware(t.Context(), opa.Config{
 		Policy: policy,
 		Data:   `{"allowed_methods": {"DELETE": true}}`,
-	}, next)
+	}, false, next)
 	assert.NoError(t, err)
 
 	tests := []struct {
@@ -172,14 +172,14 @@ allow if data.allowed_methods[input.method]
 
 func TestMiddlewareBothDataAndDataFileError(t *testing.T) {
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{Data: "{}", DataFile: "x"}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{Data: "{}", DataFile: "x"}, false, next)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "only one of")
 }
 
 func TestMiddlewareInlineDataInvalidJSON(t *testing.T) {
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{Data: "{not json}"}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{Data: "{not json}"}, false, next)
 	assert.Error(t, err)
 }
 
@@ -197,7 +197,7 @@ allow if data.allowed_methods[input.method]
 	assert.NoError(t, os.WriteFile(dataPath, []byte(dataJSON), 0o644))
 
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{PolicyFile: policyPath, DataFile: dataPath}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{PolicyFile: policyPath, DataFile: dataPath}, false, next)
 	assert.NoError(t, err)
 
 	tests := []struct {
@@ -221,7 +221,7 @@ allow if data.allowed_methods[input.method]
 
 func TestMiddlewareDataFileMissing(t *testing.T) {
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{DataFile: "/nonexistent"}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{DataFile: "/nonexistent"}, false, next)
 	assert.Error(t, err)
 }
 
@@ -231,26 +231,26 @@ func TestMiddlewareDataFileInvalidJSON(t *testing.T) {
 	assert.NoError(t, os.WriteFile(dataPath, []byte("{not json}"), 0o644))
 
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{DataFile: dataPath}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{DataFile: dataPath}, false, next)
 	assert.Error(t, err)
 }
 
 func TestMiddlewareBothPolicyAndFileError(t *testing.T) {
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{Policy: "x", PolicyFile: "y"}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{Policy: "x", PolicyFile: "y"}, false, next)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "only one of")
 }
 
 func TestMiddlewarePolicyFileMissing(t *testing.T) {
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{PolicyFile: "/nonexistent"}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{PolicyFile: "/nonexistent"}, false, next)
 	assert.Error(t, err)
 }
 
 func TestMiddlewareInvalidPolicy(t *testing.T) {
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := opa.Middleware(t.Context(), opa.Config{Policy: "not valid rego {"}, next)
+	_, err := opa.Middleware(t.Context(), opa.Config{Policy: "not valid rego {"}, false, next)
 	assert.Error(t, err)
 }
 
@@ -260,7 +260,7 @@ default allow := false
 allow if input.headers["authorization"]
 `
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, false, next)
 	assert.NoError(t, err)
 
 	r := newRequest(http.MethodGet, "/")
@@ -369,7 +369,7 @@ func TestMiddlewareEmptyPolicyDeniesAll(t *testing.T) {
 	policy := `package cachew.authz
 `
 	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
-	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, next)
+	handler, err := opa.Middleware(t.Context(), opa.Config{Policy: policy}, false, next)
 	assert.NoError(t, err)
 
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {

@@ -16,6 +16,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/tester"
 
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/oidc"
 )
 
 // DefaultPolicy allows all requests from localhost and restricts remote access to non-admin paths.
@@ -39,10 +40,21 @@ type Config struct {
 // Middleware returns an http.Handler that evaluates OPA policy before delegating to next.
 // The policy must define a boolean "allow" rule under package cachew.authz.
 // If allow is true the request proceeds; otherwise it is rejected with 403.
-func Middleware(ctx context.Context, cfg Config, next http.Handler) (http.Handler, error) {
+//
+// When oidcConfigured is true the raw Authorization header is withheld from the
+// policy input; see buildInput.
+func Middleware(ctx context.Context, cfg Config, oidcConfigured bool, next http.Handler) (http.Handler, error) {
 	policy, err := loadPolicy(cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	// A policy keyed on the raw Authorization header silently stops matching the
+	// moment OIDC is enabled, surfacing only as request-time denials — warn at
+	// startup so the operator finds out before traffic does.
+	if oidcConfigured && policyReferencesAuthorizationHeader(policy) {
+		logging.FromContextOrDefault(ctx).WarnContext(ctx, `OPA policy references input.headers["authorization"], `+
+			`which is withheld from policy input while OIDC issuers are configured; authenticate with input.token instead`)
 	}
 
 	dataOpts, err := dataOptions(cfg)
@@ -56,7 +68,7 @@ func Middleware(ctx context.Context, cfg Config, next http.Handler) (http.Handle
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		input := buildInput(r)
+		input := buildInput(r, oidcConfigured)
 		logger := logging.FromContext(r.Context())
 
 		allowed, err := evalAllow(r.Context(), prepared, input)
@@ -125,6 +137,34 @@ func RunTests(ctx context.Context, cfg Config) (int, error) {
 		return passed, errors.Errorf("OPA tests failed: %s", strings.Join(failures, "; "))
 	}
 	return passed, nil
+}
+
+// policyReferencesAuthorizationHeader reports whether the Rego source dereferences
+// an "authorization" field anywhere.
+//
+// This exists only to drive a startup warning — buildInput withholds the header
+// unconditionally whenever OIDC is configured, so a missed match here cannot
+// re-expose it. The policy is parsed and its references walked rather than
+// substring-matched, so formatting, bracket-vs-dot form, and indirection through a
+// local variable all still trigger the warning. Dynamic access (iterating over all
+// headers) is inherently undetectable and not warned about.
+func policyReferencesAuthorizationHeader(policy string) bool {
+	module, err := ast.ParseModule("policy.rego", policy)
+	if err != nil {
+		// The policy fails to compile later anyway; being generous here only
+		// risks a spurious warning.
+		return strings.Contains(strings.ToLower(policy), "authorization")
+	}
+	found := false
+	ast.WalkRefs(module, func(ref ast.Ref) bool {
+		for _, term := range ref {
+			if s, ok := term.Value.(ast.String); ok && strings.EqualFold(string(s), "authorization") {
+				found = true
+			}
+		}
+		return found
+	})
+	return found
 }
 
 // parseTestModules parses the policy and test Rego sources into modules keyed by filename.
@@ -218,7 +258,14 @@ func loadData(cfg Config) (map[string]any, error) {
 	return data, nil
 }
 
-func buildInput(r *http.Request) map[string]any {
+// buildInput assembles the policy input for a request.
+//
+// When OIDC is configured the "authorization" header is deliberately omitted:
+// policy gets verified identity via input.token, and leaving the raw header
+// visible invites rules like `allow if input.headers["authorization"]`, which any
+// attacker-supplied header value would satisfy. With no issuers configured the
+// input is unchanged, so existing policies keep working.
+func buildInput(r *http.Request, oidcConfigured bool) map[string]any {
 	path := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(path) == 1 && path[0] == "" {
 		path = []string{}
@@ -226,13 +273,30 @@ func buildInput(r *http.Request) map[string]any {
 
 	headers := make(map[string]string, len(r.Header))
 	for k, v := range r.Header {
-		headers[strings.ToLower(k)] = v[0]
+		key := strings.ToLower(k)
+		if oidcConfigured && key == "authorization" {
+			continue
+		}
+		headers[key] = v[0]
 	}
 
-	return map[string]any{
+	input := map[string]any{
 		"method":      r.Method,
 		"path":        path,
 		"headers":     headers,
 		"remote_addr": r.RemoteAddr,
 	}
+
+	// Absent for unauthenticated requests, so that policy rules referencing it
+	// evaluate to undefined and the policy's default deny applies.
+	if claims, ok := oidc.ClaimsFromContext(r.Context()); ok {
+		input["token"] = map[string]any{
+			"issuer":   claims.Issuer,
+			"subject":  claims.Subject,
+			"audience": claims.Audience,
+			"claims":   claims.Raw,
+		}
+	}
+
+	return input
 }

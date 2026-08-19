@@ -94,6 +94,16 @@ func FromContext(ctx context.Context) *slog.Logger {
 	return logger
 }
 
+// FromContextOrDefault returns the context's logger, or slog.Default() when the
+// context carries none. For code paths that may legitimately run before or
+// without logging.Configure, where FromContext's panic would be unwarranted.
+func FromContextOrDefault(ctx context.Context) *slog.Logger {
+	if logger, ok := ctx.Value(logKey{}).(*slog.Logger); ok {
+		return logger
+	}
+	return slog.Default()
+}
+
 // ContextWithLogger returns a new context with the given logger.
 func ContextWithLogger(ctx context.Context, logger *slog.Logger) context.Context {
 	return context.WithValue(ctx, logKey{}, logger)

@@ -27,6 +27,15 @@ opa {
   EOF
 }
 
+# Trust an OIDC issuer so remote callers can authenticate to /api and /admin with a
+# bearer token. The issuer must exactly match the token's "iss" claim; for AWS STS
+# it is account-specific, so mint a token and read its "iss" rather than guessing.
+# See "OIDC Authentication" in README.md for a policy that uses the claims.
+#
+# oidc-issuer "https://abc123-def456-ghi789.tokens.sts.global.api.aws" {
+#   audiences = ["https://cachew.example.com"]
+# }
+
 # github-app {
 #   app-id = "app-id-value"
 #   private-key-path = "private-key-path-value"
